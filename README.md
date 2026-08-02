@@ -1,61 +1,119 @@
-# observai-sdk (v0.2 — matches the real backend contract)
+# observai-sdk
 
-This version was built by reading the ACTUAL backend code in your friend's repo
-(`backend/api/v1/sdk.py` and `backend/schemas/telemetry.py`), not guessed.
+Lightweight Node.js SDK for [ObservAI] — an AI-powered observability platform that automatically detects production incidents and generates Root Cause Analysis reports.
 
-## Real contract confirmed
-- URL: `POST http://localhost:8000/api/v1/sdk/ingest` (change host once deployed)
-- Header: `X-API-Key: <your_api_key>`
-- Body: `{ api_key, service_name, environment, logs[], exceptions[], traces[], metrics[], deployments[] }`
-- Success: HTTP `202`
-
-## Test it yourself (proves it works before touching the real dummy site)
-
-```bash
-npm install
-cd example && npm install
-node mock-backend.js     # terminal 1 — simulates the real endpoint
-node app.js               # terminal 2 — your test app using the SDK
-```
-Visit `http://localhost:3000/` and `http://localhost:3000/error` — watch the mock
-backend terminal print the exact payload it received.
-
-## Wire into your real dummy MERN site
+Add it to any Express app in 3 lines. No changes to your existing routes.
 
 ```javascript
 const { ObserveAIClient } = require('observai-sdk');
+const client = new ObserveAIClient({ apiKey: 'obs_live_xxx', serviceName: 'checkout-service' });
+app.use(client.expressMiddleware());
+```
+
+---
+
+## Features
+
+- 🔍 **Auto-captures requests** — method, path, status code, duration, as structured logs and trace spans
+- 🚨 **Auto-captures errors** — full stack traces via `expressErrorHandler()`
+- 🗃️ **MongoDB/Mongoose query tracing** — via `mongooseMiddleware()`
+- 📦 **Batching** — buffers events in memory, flushes every 5s or 100 events, so your app never pays a per-request network cost
+- 🔁 **Retry with backoff** — 3 attempts (500ms → 1s → 2s) before a batch is dropped, so a network blip doesn't silently lose data
+- 🪶 **Zero disk writes** — everything lives in memory and streams out over HTTP; no log files to manage or rotate
+
+---
+
+## Install
+
+```bash
+npm install github:YOUR_USERNAME/observai-sdk
+```
+(Will become `npm install observai-sdk` once published to the public npm registry.)
+
+---
+
+## Quick Start
+
+```javascript
+const express = require('express');
+const { ObserveAIClient } = require('observai-sdk');
 
 const client = new ObserveAIClient({
-  apiKey: 'YOUR_REAL_API_KEY',       // get from your friend / the dashboard
-  serviceName: 'my-dummy-store',
-  endpointUrl: 'http://localhost:8000/api/v1/sdk/ingest',  // or deployed URL
-  environment: 'staging',
+  apiKey: 'obs_live_xxx',           // from your ObservAI project settings
+  serviceName: 'checkout-service',
+  endpointUrl: 'https://api.observai.dev/api/v1/sdk/ingest',
+  environment: 'production',
 });
 
-app.use(client.expressMiddleware());   // auto-logs every request
-// ... your existing routes, unchanged ...
-app.use(client.expressErrorHandler()); // auto-captures errors
-```
-Three lines added to your existing app. No route code changes.
+const app = express();
 
-## Manual capture (for anything not auto-covered)
-```javascript
-client.captureLog('WARN', 'Payment retry attempted', { orderId: 123 });
-client.captureException(someError, false);
+app.use(client.expressMiddleware());     // auto-logs + traces every request
+
+app.get('/', (req, res) => res.send('OK'));
+
+app.use(client.expressErrorHandler());   // auto-captures unhandled errors
+app.listen(3000);
 ```
 
-## MongoDB / Mongoose auto-tracing
+### With MongoDB
 
-Every schema gets automatic query tracing (find, save, update, delete, count):
 ```javascript
 const mongoose = require('mongoose');
-mongoose.plugin(client.mongooseMiddleware());   // add BEFORE defining your models
+mongoose.plugin(client.mongooseMiddleware());   // add BEFORE defining your schemas
 ```
 
-## What's tested vs. not yet tested
+### Manual capture
 
-- ✅ Express request/error auto-capture — tested end-to-end against a mock server
-- ✅ Retry with backoff on flush failure — tested by killing the backend mid-flight
-- ⚠️ Mongoose auto-tracing — written the same way as the working Express tracing,
-  but NOT yet verified against a real MongoDB connection. Test this yourself once
-  wired into the real site, and report back if the trace doesn't appear.
+```javascript
+client.captureLog('WARN', 'Payment retry attempted', { orderId: 123 });
+client.captureException(someError, /* handled */ true);
+```
+
+---
+
+## Configuration
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `apiKey` | ✅ | — | Your project's API key |
+| `serviceName` | ✅ | — | Name shown in the ObservAI dashboard |
+| `endpointUrl` | | `http://localhost:8000/api/v1/sdk/ingest` | Where telemetry is sent |
+| `environment` | | `'production'` | Tag for filtering (e.g. `staging`, `production`) |
+| `maxBatchSize` | | `100` | Force a flush after this many buffered events |
+| `flushIntervalMs` | | `5000` | Max time between flushes |
+
+---
+
+## How it works
+
+```
+Your app runs
+     │
+     ▼
+Request/error happens → captured as an in-memory object (no disk writes)
+     │
+     ▼
+Buffered with recent events
+     │
+     ▼
+Every 5s or 100 events → sent as one HTTP POST (JSON body, X-API-Key header)
+     │
+     ▼
+ObservAI backend → stores it → AI agents investigate → RCA report
+```
+
+---
+
+## Status
+
+| Feature | Status |
+|---|---|
+| Express request/error capture | ✅ Tested end-to-end |
+| Retry with backoff | ✅ Tested (verified against a killed connection) |
+| Mongoose query tracing | ⚠️ Implemented, not yet verified against a live MongoDB instance |
+
+---
+
+## License
+
+MIT
