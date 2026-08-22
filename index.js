@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { AsyncLocalStorage } = require('async_hooks');
 
 /**
  * Node.js port of the backend's own reference client (backend/sdk/client.py).
@@ -24,6 +25,22 @@ const axios = require('axios');
  *   until the buffer is empty and no flush is pending, bounded by an
  *   overall deadline — so a flush-triggered-during-shutdown-flush can't
  *   quietly get skipped, and the process still can't hang forever.
+ *
+ * Trace propagation notes (added in this version):
+ * - expressMiddleware() runs the rest of the request (next(), and
+ *   everything it triggers — sync or async, however many layers deep)
+ *   inside an AsyncLocalStorage context holding that request's
+ *   { traceId, spanId }. This is Node's built-in mechanism for exactly
+ *   this problem: the context correctly survives promises, async/await,
+ *   timers, and most callback-based async work, without needing `req` to
+ *   be threaded through every controller/service/model function manually.
+ * - mongooseMiddleware() reads that active context (if any) via
+ *   this._httpContext.getStore(). If a Mongoose operation runs while an
+ *   HTTP request is active, it reuses that request's traceId and records
+ *   the HTTP span as its parent — a proper child span, not a new root
+ *   trace. If no HTTP request is active (e.g. a background job, a script,
+ *   startup code), it falls back to generating its own root trace, exactly
+ *   as before — standalone Mongoose usage is unaffected.
  */
 class ObserveAIClient {
   constructor({
@@ -50,6 +67,11 @@ class ObserveAIClient {
     this.shutdownFlushTimeoutMs = shutdownFlushTimeoutMs;
 
     this._buffer = { logs: [], exceptions: [], traces: [], metrics: [], deployments: [] };
+
+    // Holds the currently-active HTTP request's { traceId, spanId } for the
+    // lifetime of that request's async call chain (see expressMiddleware
+    // and mongooseMiddleware below, and the class doc above).
+    this._httpContext = new AsyncLocalStorage();
 
     // --- concurrency control -------------------------------------------
     // _flushInFlight: the Promise of the currently-running flush, or null.
@@ -299,8 +321,9 @@ class ObserveAIClient {
   }
 
   // Express middleware: auto-captures every request as BOTH a log line and a trace span.
-  // Also stamps a trace_id onto the request so DB calls made during this request
-  // (via mongooseMiddleware) can be linked back to it.
+  // Also runs the rest of the request inside an AsyncLocalStorage context so any
+  // Mongoose query triggered during this request — however deep — can correctly
+  // attach itself as a child span of this request's trace (see mongooseMiddleware).
   expressMiddleware() {
     return (req, res, next) => {
       const start = Date.now();
@@ -324,7 +347,10 @@ class ObserveAIClient {
           attributes: { 'http.method': req.method, 'http.path': req.originalUrl },
         });
       });
-      next();
+
+      this._httpContext.run({ traceId, spanId }, () => {
+        next();
+      });
     };
   }
 
@@ -334,8 +360,12 @@ class ObserveAIClient {
     return out.slice(0, len);
   }
 
-  // Mongoose plugin: auto-captures every DB query as a child trace span,
-  // linked to the current request's trace_id when available.
+  // Mongoose plugin: auto-captures every DB query as a child trace span.
+  // If it runs inside an active HTTP request (per _httpContext, set up in
+  // expressMiddleware above), it inherits that request's traceId and is
+  // recorded as a child of the HTTP span — a correlated trace, not a new
+  // root. Outside an HTTP request, it falls back to generating its own
+  // root trace, same as before.
   mongooseMiddleware() {
     const self = this;
     return function plugin(schema) {
@@ -345,9 +375,12 @@ class ObserveAIClient {
       });
       schema.post(/^find|save|update|delete|count/, function (_doc, next) {
         const durationMs = Date.now() - (this._observaiStart || Date.now());
+        const activeHttpContext = self._httpContext.getStore();
+
         self.captureTrace({
-          traceId: this._observaiTraceId || self._generateId(32),
+          traceId: activeHttpContext ? activeHttpContext.traceId : self._generateId(32),
           spanId: self._generateId(16),
+          parentSpanId: activeHttpContext ? activeHttpContext.spanId : undefined,
           operationName: `mongodb.${this.op || 'query'} ${this.model ? this.model.collection.name : ''}`,
           durationMs,
           statusCode: 200,
